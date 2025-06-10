@@ -1,0 +1,31 @@
+{
+  "name": "encore-ts-diy-projects-api",
+  "version": "1.0.0",
+  "description": "🔨 DIY Projects Management API built with Encore.ts - Showcasing type-safe APIs, automatic validation, and infrastructure management",
+  "scripts": {
+    "dev": "encore run",
+    "build": "encore build",
+    "test": "encore test",
+    "deploy": "encore deploy"
+  },
+  "keywords": [
+    "encore",
+    "typescript",
+    "backend",
+    "api",
+    "microservices",
+    "diy",
+    "projects",
+    "example",
+    "demo"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/creach-t/encore-ts-diy-projects-api.git"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
