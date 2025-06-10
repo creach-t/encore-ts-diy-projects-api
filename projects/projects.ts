@@ -1,5 +1,7 @@
 import { api } from "encore.dev/api";
 import { SQLDatabase } from "encore.dev/storage/sqldb";
+// Import inter-service communication
+import * as materials from "../materials/materials";
 import {
   Project,
   CreateProjectRequest,
@@ -24,12 +26,18 @@ const db = new SQLDatabase("projects", {
 export const createProject = api(
   { expose: true, method: "POST", path: "/projects" },
   async (req: CreateProjectRequest): Promise<Project> => {
-    // Calculate estimated cost from materials
+    // Get real material pricing from materials service
+    const materialIds = req.materials.map(m => m.materialId);
+    const materialPricing = await materials.getMaterialPricing(materialIds);
+
+    // Calculate real estimated cost
     let estimatedCost = 0;
     for (const material of req.materials) {
-      // In a real app, you'd fetch material price from materials service
-      // For demo purposes, we'll use a simple calculation
-      estimatedCost += material.quantity * 10; // Placeholder price
+      const pricing = materialPricing[material.materialId];
+      if (!pricing) {
+        throw new Error(`Material with id ${material.materialId} not found`);
+      }
+      estimatedCost += material.quantity * pricing.price;
     }
 
     // Insert project into database
@@ -45,13 +53,16 @@ export const createProject = api(
       ) RETURNING id
     `.then(result => result[0].id);
 
-    // Insert project materials
+    // Insert project materials with real pricing
     for (const material of req.materials) {
+      const pricing = materialPricing[material.materialId];
+      const totalPrice = material.quantity * pricing.price;
+      
       await db.exec`
         INSERT INTO project_materials (project_id, material_id, quantity, unit_price, total_price, notes)
         VALUES (
           ${projectId}, ${material.materialId}, ${material.quantity}, 
-          10, ${material.quantity * 10}, ${material.notes || ''}
+          ${pricing.price}, ${totalPrice}, ${material.notes || ''}
         )
       `;
     }
@@ -105,8 +116,8 @@ async function getProjectById({ id }: { id: number }): Promise<Project> {
     difficulty: project.difficulty,
     category: project.category,
     estimatedHours: project.estimated_hours,
-    estimatedCost: project.estimated_cost,
-    actualCost: project.actual_cost,
+    estimatedCost: parseFloat(project.estimated_cost),
+    actualCost: project.actual_cost ? parseFloat(project.actual_cost) : undefined,
     status: project.status,
     materials: project.materials,
     instructions: JSON.parse(project.instructions || '[]'),
@@ -159,6 +170,16 @@ export const listProjects = api(
       queryParams.push(params.maxHours);
     }
 
+    if (params.minCost) {
+      whereClause += ` AND estimated_cost >= $${++paramCount}`;
+      queryParams.push(params.minCost);
+    }
+
+    if (params.maxCost) {
+      whereClause += ` AND estimated_cost <= $${++paramCount}`;
+      queryParams.push(params.maxCost);
+    }
+
     // Execute query with pagination
     const projects = await db.exec`
       SELECT * FROM projects 
@@ -179,8 +200,8 @@ export const listProjects = api(
         difficulty: p.difficulty,
         category: p.category,
         estimatedHours: p.estimated_hours,
-        estimatedCost: p.estimated_cost,
-        actualCost: p.actual_cost,
+        estimatedCost: parseFloat(p.estimated_cost),
+        actualCost: p.actual_cost ? parseFloat(p.actual_cost) : undefined,
         status: p.status,
         materials: [], // Not loaded in list view for performance
         instructions: JSON.parse(p.instructions || '[]'),
@@ -201,6 +222,43 @@ export const listProjects = api(
 export const updateProject = api(
   { expose: true, method: "PUT", path: "/projects/:id" },
   async ({ id, ...updates }: { id: number } & UpdateProjectRequest): Promise<Project> => {
+    // If materials are being updated, recalculate cost
+    if (updates.materials && updates.materials.length > 0) {
+      const materialIds = updates.materials.map(m => m.materialId);
+      const materialPricing = await materials.getMaterialPricing(materialIds);
+      
+      let newEstimatedCost = 0;
+      for (const material of updates.materials) {
+        const pricing = materialPricing[material.materialId];
+        if (!pricing) {
+          throw new Error(`Material with id ${material.materialId} not found`);
+        }
+        newEstimatedCost += material.quantity * pricing.price;
+      }
+
+      // Update estimated cost
+      updates.estimatedCost = newEstimatedCost;
+
+      // Delete existing materials and insert new ones
+      await db.exec`DELETE FROM project_materials WHERE project_id = ${id}`;
+      
+      for (const material of updates.materials) {
+        const pricing = materialPricing[material.materialId];
+        const totalPrice = material.quantity * pricing.price;
+        
+        await db.exec`
+          INSERT INTO project_materials (project_id, material_id, quantity, unit_price, total_price, notes)
+          VALUES (
+            ${id}, ${material.materialId}, ${material.quantity}, 
+            ${pricing.price}, ${totalPrice}, ${material.notes || ''}
+          )
+        `;
+      }
+
+      // Remove materials from updates object as it's handled separately
+      delete updates.materials;
+    }
+
     // Build dynamic UPDATE query
     const updateFields: string[] = [];
     const updateValues: any[] = [];
@@ -214,6 +272,9 @@ export const updateProject = api(
           updateValues.push(JSON.stringify(value));
         } else if (key === 'estimatedHours') {
           updateFields.push(`estimated_hours = $${paramCount}`);
+          updateValues.push(value);
+        } else if (key === 'estimatedCost') {
+          updateFields.push(`estimated_cost = $${paramCount}`);
           updateValues.push(value);
         } else if (key === 'actualCost') {
           updateFields.push(`actual_cost = $${paramCount}`);
@@ -319,5 +380,133 @@ export const getProjectStats = api(
       totalEstimatedCost: parseFloat(stats[0].total_estimated_cost) || 0,
       totalActualCost: parseFloat(stats[0].total_actual_cost) || 0
     };
+  }
+);
+
+// ============================================================================
+// PROJECT MATERIAL MANAGEMENT
+// ============================================================================
+
+// Start a project (reserve materials)
+export const startProject = api(
+  { expose: true, method: "POST", path: "/projects/:id/start" },
+  async ({ id }: { id: number }): Promise<Project> => {
+    // Get project materials
+    const projectMaterials = await db.exec`
+      SELECT material_id, quantity FROM project_materials WHERE project_id = ${id}
+    `;
+
+    if (projectMaterials.length === 0) {
+      throw new Error("Project has no materials to reserve");
+    }
+
+    // Reserve materials in the materials service
+    const reservations = projectMaterials.map(pm => ({
+      materialId: pm.material_id,
+      quantity: pm.quantity,
+      reason: `Reserved for project ${id} - started`
+    }));
+
+    await materials.reserveMaterials(reservations);
+
+    // Update project status
+    await db.exec`
+      UPDATE projects 
+      SET status = 'in_progress', updated_at = NOW()
+      WHERE id = ${id}
+    `;
+
+    return await getProjectById({ id });
+  }
+);
+
+// Calculate current project cost with updated material prices
+export const recalculateProjectCost = api(
+  { expose: true, method: "POST", path: "/projects/:id/recalculate-cost" },
+  async ({ id }: { id: number }): Promise<Project> => {
+    // Get current project materials
+    const projectMaterials = await db.exec`
+      SELECT material_id, quantity FROM project_materials WHERE project_id = ${id}
+    `;
+
+    if (projectMaterials.length === 0) {
+      throw new Error("Project has no materials");
+    }
+
+    // Get current material pricing
+    const materialIds = projectMaterials.map(pm => pm.material_id);
+    const materialPricing = await materials.getMaterialPricing(materialIds);
+
+    let newEstimatedCost = 0;
+
+    // Update each material with current pricing
+    for (const pm of projectMaterials) {
+      const pricing = materialPricing[pm.material_id];
+      if (!pricing) {
+        throw new Error(`Material with id ${pm.material_id} not found`);
+      }
+
+      const newTotalPrice = pm.quantity * pricing.price;
+      newEstimatedCost += newTotalPrice;
+
+      await db.exec`
+        UPDATE project_materials 
+        SET unit_price = ${pricing.price}, total_price = ${newTotalPrice}
+        WHERE project_id = ${id} AND material_id = ${pm.material_id}
+      `;
+    }
+
+    // Update project estimated cost
+    await db.exec`
+      UPDATE projects 
+      SET estimated_cost = ${newEstimatedCost}, updated_at = NOW()
+      WHERE id = ${id}
+    `;
+
+    return await getProjectById({ id });
+  }
+);
+
+// Get projects that can be started (all materials available)
+export const getStartableProjects = api(
+  { expose: true, method: "GET", path: "/projects/startable" },
+  async (): Promise<Project[]> => {
+    // Get all planning projects
+    const planningProjects = await db.exec`
+      SELECT DISTINCT p.id 
+      FROM projects p
+      WHERE p.status = 'planning'
+    `;
+
+    const startableProjects: Project[] = [];
+
+    for (const project of planningProjects) {
+      // Get project materials
+      const projectMaterials = await db.exec`
+        SELECT material_id, quantity FROM project_materials WHERE project_id = ${project.id}
+      `;
+
+      if (projectMaterials.length === 0) continue;
+
+      // Check if all materials are available
+      const materialIds = projectMaterials.map(pm => pm.material_id);
+      const materialPricing = await materials.getMaterialPricing(materialIds);
+
+      let allAvailable = true;
+      for (const pm of projectMaterials) {
+        const pricing = materialPricing[pm.material_id];
+        if (!pricing || !pricing.inStock || pricing.available < pm.quantity) {
+          allAvailable = false;
+          break;
+        }
+      }
+
+      if (allAvailable) {
+        const fullProject = await getProjectById({ id: project.id });
+        startableProjects.push(fullProject);
+      }
+    }
+
+    return startableProjects;
   }
 );
